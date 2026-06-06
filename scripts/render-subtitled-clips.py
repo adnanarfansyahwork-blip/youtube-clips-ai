@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 import argparse
+import contextlib
+import fcntl
+import gc
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -10,6 +14,19 @@ from faster_whisper import WhisperModel
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE = ROOT / "workspace"
+PIPELINE_LOCK_FILE = WORKSPACE / "tmp" / "content-pipeline.lock"
+PIPELINE_LOCK_ENV = "CONTENT_AUTOMATION_QUEUE_HELD"
+SUBTITLE_MARGIN_V = 760
+TYPO_FIXES = {
+    "RADITIKA": "RADITYA DIKA",
+    "RADITYA DIKA DIKA": "RADITYA DIKA",
+    "RANZ": "RANS",
+    "RENS": "RANS",
+    "RAFI AHMAD": "RAFFI AHMAD",
+    "NAGITA SLAFINA": "NAGITA SLAVINA",
+    "TIK TOK": "TIKTOK",
+    "YOUTUB": "YOUTUBE",
+}
 
 
 def run(cmd):
@@ -43,6 +60,27 @@ def save_job(path, job):
     path.write_text(json.dumps(job, indent=2, sort_keys=True) + "\n")
 
 
+@contextlib.contextmanager
+def queued_pipeline(label):
+    """Serialize RAM-heavy subtitle jobs when called outside mvp.py."""
+    (WORKSPACE / "tmp").mkdir(parents=True, exist_ok=True)
+    if os.environ.get(PIPELINE_LOCK_ENV):
+        yield
+        return
+
+    with PIPELINE_LOCK_FILE.open("w") as lock:
+        print(f"[queue] waiting for content pipeline slot: {label}")
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        os.environ[PIPELINE_LOCK_ENV] = "1"
+        print(f"[queue] started: {label}")
+        try:
+            yield
+        finally:
+            os.environ.pop(PIPELINE_LOCK_ENV, None)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            print(f"[queue] finished: {label}")
+
+
 def ass_time(seconds):
     seconds = max(0, float(seconds))
     cs = int(round(seconds * 100))
@@ -58,6 +96,9 @@ def ass_time(seconds):
 def clean_caption(text):
     text = re.sub(r"\s+", " ", text or "").strip()
     text = re.sub(r"[{}]", "", text)
+    text = text.upper()
+    for wrong, right in TYPO_FIXES.items():
+        text = re.sub(rf"\b{re.escape(wrong)}\b", right, text)
     return text.upper()
 
 
@@ -76,7 +117,7 @@ def ass_escape_path(path):
 
 
 def write_ass(path, segments):
-    header = """[Script Info]
+    header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
 PlayResY: 1920
@@ -84,7 +125,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Shorts,DejaVu Sans,70,&H00FFFFFF,&H0000FFFF,&H00000000,&HAA000000,-1,0,0,0,100,100,0,0,1,7,2,2,80,80,250,1
+Style: Shorts,Anton,85,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,-1,0,0,0,100,100,2,0,1,8,0,2,60,60,{SUBTITLE_MARGIN_V},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -124,16 +165,14 @@ def _render_wide_pair(source, start, duration, ass_file, out_path):
     ])
 
 
-def render_subtitled_clip(source, clip, model, job_id):
-    """Transcribe once, then render one layout-aware wide/pair version."""
+def _transcribe_clip(source, clip, model, job_id):
+    """Phase 1: extract audio + transcribe + write .ass (model still loaded)."""
     index = clip["index"]
     start = clip["start_seconds"]
     duration = clip["duration_seconds"]
     tmp_audio = WORKSPACE / "tmp" / f"{job_id}_clip{index}.wav"
     ass_file = WORKSPACE / "subtitles" / f"{job_id}_clip{index}.ass"
-    out_file = WORKSPACE / "clips" / f"{job_id}_clip{index}_subtitled.mp4"
 
-    # Extract mono audio for transcription
     run([
         ffmpeg_bin(), "-y",
         "-ss", str(start),
@@ -143,13 +182,15 @@ def render_subtitled_clip(source, clip, model, job_id):
         str(tmp_audio),
     ])
 
-    # vad_filter=False keeps all speech; beam_size=5 reduces word misses
     segments, info = model.transcribe(
         str(tmp_audio),
         language="id",
         vad_filter=False,
         beam_size=5,
+        best_of=5,
+        temperature=0,
         condition_on_previous_text=False,
+        hallucination_silence_threshold=1.0,
     )
     caption_segments = [
         {"start": seg.start, "end": seg.end, "text": seg.text}
@@ -158,41 +199,77 @@ def render_subtitled_clip(source, clip, model, job_id):
     ]
     write_ass(ass_file, caption_segments)
 
+    clip["subtitle_file"] = str(ass_file)
+    clip["subtitle_segments"] = caption_segments
+    clip["subtitle_language"] = getattr(info, "language", "id")
+
+    # cleanup temp audio immediately to free disk
+    tmp_audio.unlink(missing_ok=True)
+
+
+def _render_clip_with_ass(source, clip, job_id):
+    """Phase 2: ffmpeg render using pre-generated .ass (model already freed)."""
+    index = clip["index"]
+    start = clip["start_seconds"]
+    duration = clip["duration_seconds"]
+    ass_file = Path(clip["subtitle_file"])
+    out_file = WORKSPACE / "clips" / f"{job_id}_clip{index}_subtitled.mp4"
+
     _render_wide_pair(source, start, duration, ass_file, out_file)
 
     clip["captioned_file"] = str(out_file)
     clip.pop("captioned_file_left", None)
     clip.pop("captioned_file_right", None)
-    clip["subtitle_file"] = str(ass_file)
-    clip["subtitle_segments"] = caption_segments
-    clip["subtitle_language"] = getattr(info, "language", "id")
     clip["layout"] = "wide_pair"
     clip.pop("overlay_label", None)
     clip["status"] = "captioned"
     return out_file
 
 
+def render_subtitled_clip(source, clip, model, job_id):
+    """Legacy single-clip helper (used by external callers)."""
+    _transcribe_clip(source, clip, model, job_id)
+    return _render_clip_with_ass(source, clip, job_id)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("job_id")
-    parser.add_argument("--model", default="small")
+    parser.add_argument(
+        "--model",
+        default="medium",
+        help="faster-whisper model. Use medium for upload quality, large-v3/large-v3-turbo for best accuracy.",
+    )
     args = parser.parse_args()
 
-    for name in ["tmp", "subtitles", "clips"]:
-        (WORKSPACE / name).mkdir(parents=True, exist_ok=True)
+    with queued_pipeline(f"render-subtitles {args.job_id}"):
+        for name in ["tmp", "subtitles", "clips"]:
+            (WORKSPACE / name).mkdir(parents=True, exist_ok=True)
 
-    job_path, job = load_job(args.job_id)
-    source = Path(job["source_file"])
-    model = WhisperModel(args.model, device="cpu", compute_type="int8")
-    outputs = []
-    for clip in job.get("clips", []):
-        out_file = render_subtitled_clip(source, clip, model, job["job_id"])
-        outputs.append(str(out_file))
-    job["status"] = "captioned"
-    job["preferred_output"] = "captioned_file"
-    job["default_layout"] = "wide_pair"
-    save_job(job_path, job)
-    print(json.dumps(outputs, indent=2))
+        job_path, job = load_job(args.job_id)
+        source = Path(job["source_file"])
+        clips = job.get("clips", [])
+
+        # Process one clip at a time: load model → transcribe → unload → render
+        # This keeps peak RAM usage to one clip worth of memory at a time.
+        outputs = []
+        for i, clip in enumerate(clips, 1):
+            print(f"[{i}/{len(clips)}] Transcribing clip {clip['index']} (model={args.model})...")
+            model = WhisperModel(args.model, device="cpu", compute_type="int8")
+            _transcribe_clip(source, clip, model, job["job_id"])
+            del model
+            gc.collect()
+
+            print(f"[{i}/{len(clips)}] Rendering clip {clip['index']}...")
+            out_file = _render_clip_with_ass(source, clip, job["job_id"])
+            outputs.append(str(out_file))
+            gc.collect()
+
+        job["status"] = "captioned"
+        job["preferred_output"] = "captioned_file"
+        job["default_layout"] = "wide_pair"
+        save_job(job_path, job)
+        print(json.dumps(outputs, indent=2))
 
 
 if __name__ == "__main__":

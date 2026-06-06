@@ -9,6 +9,8 @@ Pipeline:
 4. Generate subtitle/caption otomatis pakai `faster-whisper`
 5. Upload ke YouTube (unlisted/private/public) via YouTube Data API v3
 
+Job berat berjalan lewat antrean global di `workspace/tmp/content-pipeline.lock`, jadi beberapa cron/manual run tidak akan load Whisper/ffmpeg bersamaan dan membuat RAM berat.
+
 ---
 
 ## 🎬 Sample Output
@@ -21,7 +23,7 @@ Contoh hasil clip yang dirender oleh pipeline ini (format 9:16 vertical, wide-pa
 | 2 | Koleksinya Lebih Tua Dari Saya — clip 2 | [YouTube ↗](https://youtu.be/6XycAYcqJes) |
 | 3 | Test pipeline — 30 detik clip (yt-dlp + wide-pair render) | [YouTube ↗](https://youtu.be/zDjzBL_LqCI) |
 
-Semua clip di atas dirender dengan setting: `libx264 medium crf20`, layout `wide_pair` 1080×1920, subtitle auto dari `faster-whisper small`.
+Semua clip di atas dirender dengan setting: `libx264 medium crf20`, layout `wide_pair` 1080×1920, subtitle auto dari `faster-whisper medium`.
 
 ---
 
@@ -58,10 +60,11 @@ Setelah doctor OK, export cookies YouTube kamu:
 Lalu jalankan pipeline penuh:
 
 ```bash
-./scripts/process-link-autopilot.sh "https://youtu.be/VIDEO_ID" --clips 3 --duration 45
+./scripts/process-link-autopilot.sh "https://youtu.be/VIDEO_ID" --clips 3 --duration 45 --caption-model medium
 ```
 
 Output clip ada di `workspace/clips/` dalam format `*_subtitled.mp4`.
+Kalau ada job lain sedang render/caption, command ini akan menunggu antrean sampai slot kosong.
 
 > Upload ke YouTube butuh setup tambahan — lihat bagian [YouTube Upload API](#youtube-upload-api--setup).
 
@@ -120,9 +123,14 @@ pip install "yt-dlp[default]" --pre
 
 ### faster-whisper
 
-**Fungsi:** transkripsi audio jadi teks untuk subtitle/caption otomatis. Berjalan 100% lokal, tidak perlu API key. Model `small` sudah cukup untuk bahasa Indonesia.
+**Fungsi:** transkripsi audio jadi teks untuk subtitle/caption otomatis. Berjalan 100% lokal, tidak perlu API key. Model default `medium` dipakai untuk kualitas upload agar typo subtitle lebih sedikit.
 
-**Cara dapat:** sudah include di `requirements.txt`. Model AI-nya (~460MB untuk `small`) didownload otomatis saat pertama kali dipakai.
+**Cara dapat:** sudah include di `requirements.txt`. Model AI-nya didownload otomatis saat pertama kali dipakai.
+
+Rekomendasi model:
+- `small`: lebih cepat, cocok untuk tes.
+- `medium`: default, lebih aman untuk upload.
+- `large-v3` / `large-v3-turbo`: paling akurat, tapi lebih berat dan lebih lama.
 
 ---
 
@@ -274,13 +282,13 @@ python mvp.py init
 ### Full autopilot dari link YouTube
 
 ```bash
-python mvp.py autopilot "https://youtu.be/VIDEO_ID" --clips 3 --duration 45
+python mvp.py autopilot "https://youtu.be/VIDEO_ID" --clips 3 --duration 45 --caption-model medium
 ```
 
 Atau pakai helper script:
 
 ```bash
-./scripts/process-link-autopilot.sh "https://youtu.be/VIDEO_ID" --clips 3 --duration 45
+./scripts/process-link-autopilot.sh "https://youtu.be/VIDEO_ID" --clips 3 --duration 45 --caption-model medium
 ```
 
 Pipeline yang berjalan:
@@ -288,7 +296,7 @@ Pipeline yang berjalan:
 - Ambil metadata (judul, deskripsi)
 - Download video via yt-dlp + cookies
 - Render clip vertikal 9:16 dengan ffmpeg
-- Generate subtitle/caption dengan faster-whisper
+- Generate subtitle/caption dengan faster-whisper lewat antrean global
 - Simpan output ke `workspace/clips/`
 
 ### Dari file video lokal
@@ -313,11 +321,12 @@ python mvp.py render JOB_ID --clips 3 --duration 45
 
 ```bash
 source .venv/bin/activate
-python scripts/render-subtitled-clips.py JOB_ID --model small
+python scripts/render-subtitled-clips.py JOB_ID --model medium
 ```
 
-Model whisper yang tersedia: `tiny`, `base`, `small` (default), `medium`, `large-v3`.
+Model whisper yang tersedia: `tiny`, `base`, `small`, `medium` (default), `large-v3`, `large-v3-turbo`.
 Model lebih besar = lebih akurat tapi lebih lambat.
+Subtitle default diposisikan agak naik dari bawah supaya tidak ketutup UI Shorts/Reels/TikTok.
 
 ### Upload ke YouTube
 

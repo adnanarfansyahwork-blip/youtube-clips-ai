@@ -16,6 +16,17 @@ FFMPEG  = "/root/ffmpeg-static/ffmpeg-7.0.2-amd64-static/ffmpeg"
 FFPROBE = "/root/ffmpeg-static/ffmpeg-7.0.2-amd64-static/ffprobe"
 OUT_DIR  = Path("/root/.openclaw/workspace/content-automation/workspace/clips")
 SUBS_DIR = Path("/root/.openclaw/workspace/content-automation/workspace/subtitles")
+SUBTITLE_MARGIN_V = 760
+TYPO_FIXES = {
+    "RADITIKA": "RADITYA DIKA",
+    "RADITYA DIKA DIKA": "RADITYA DIKA",
+    "RANZ": "RANS",
+    "RENS": "RANS",
+    "RAFI AHMAD": "RAFFI AHMAD",
+    "NAGITA SLAFINA": "NAGITA SLAVINA",
+    "TIK TOK": "TIKTOK",
+    "YOUTUB": "YOUTUBE",
+}
 
 MIN_CLIP  = 30   # seconds
 MAX_CLIP  = 60   # seconds
@@ -163,7 +174,7 @@ def generate_wordlevel_ass(words, clip_offset, out_path):
         sec = cs // 100; cs %= 100
         return f"{h}:{m:02d}:{sec:02d}.{cs:02d}"
 
-    header = """[Script Info]
+    header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
 PlayResY: 1920
@@ -171,7 +182,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Pod,Arial Black,80,&H00FFFFFF,&H0000FFFF,&H00000000,&HAA000000,-1,0,0,0,100,100,0,0,1,5,2,2,60,60,180,1
+Style: Pod,Arial Black,80,&H00FFFFFF,&H0000FFFF,&H00000000,&HAA000000,-1,0,0,0,100,100,0,0,1,5,2,2,60,60,{SUBTITLE_MARGIN_V},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -194,6 +205,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             i += 1
 
         text = ' '.join(re.sub(r'[{}]', '', w['word']).strip().upper() for w in group if w['word'].strip())
+        for wrong, right in TYPO_FIXES.items():
+            text = re.sub(rf"\b{re.escape(wrong)}\b", right, text)
         if not text:
             continue
         start = ass_time(group[0]['start'])
@@ -284,10 +297,12 @@ def render_clip(video_path, clip_start, clip_dur, job_tag="smart", focus="auto",
          "-i", str(video_path), "-vn", "-ac", "1", "-ar", "16000", tmp_audio])
 
     print(f"Transcribing {clip_dur:.0f}s clip from {int(clip_start)//60:02d}:{int(clip_start)%60:02d}...")
-    model = WhisperModel("small", device="cpu", compute_type="int8")
+    model = WhisperModel("medium", device="cpu", compute_type="int8")
     segs, _ = model.transcribe(tmp_audio, language="id",
-                                word_timestamps=True, vad_filter=True,
-                                beam_size=3, condition_on_previous_text=False)
+                                word_timestamps=True, vad_filter=False,
+                                beam_size=5, best_of=5,
+                                condition_on_previous_text=False,
+                                hallucination_silence_threshold=1.0)
 
     words = []
     for seg in segs:

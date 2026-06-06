@@ -21,11 +21,12 @@ Channel pool:
 
 Important fixed system rules:
 - Never use generic preview labels such as `CLIP 1 - AUTO PREVIEW`.
-- Keep spoken transcript subtitles burned in at the bottom. Remove only top title/source overlays.
+- Keep spoken transcript subtitles burned in, but high enough above the bottom so Shorts/Reels/TikTok UI does not cover them. Remove only top title/source overlays.
 - Final/review/upload file must be `captioned_file`, not raw preview `file`, unless captioning truly failed.
 - Do not upload preview video files directly to Discord. Clips are 30-60 seconds and often exceed Discord's 10 MB limit; publish preview files to the configured public host and send URLs only.
 - Register every preview URL as pending approval. Discord approval replies should be passed to `mvp.py handle-discord-approval` so `approve`, `skip`, and `revisi ...` have deterministic behavior.
-- Subtitle rendering must use at least faster-whisper `small`; never downgrade to `base`.
+- Subtitle rendering must use faster-whisper `medium` for upload quality. Never downgrade below `small`; use `large-v3` or `large-v3-turbo` if subtitle accuracy is still poor and runtime allows it.
+- Heavy processing is queued by the local pipeline lock. Do not bypass the queue or start parallel Whisper/ffmpeg jobs manually.
 - After successful YouTube uploads, delete local video/audio assets for the job so disk does not fill up. Keep metadata and subtitles.
 - Avoid uploading the same source video or same clip twice. Maintain state in:
   `/root/.openclaw/workspace/content-automation/workspace/metadata/daily-youtube-autoupload-state.json`
@@ -49,11 +50,12 @@ Processing workflow:
 1. Run:
    `cd /root/.openclaw/workspace/content-automation`
 2. Process chosen link:
-   `./scripts/process-link-autopilot.sh "<YOUTUBE_URL>" --clips 2 --duration 45`
+   `./scripts/process-link-autopilot.sh "<YOUTUBE_URL>" --clips 2 --duration 45 --caption-model medium`
+   If another run is active, wait for the queue instead of starting a second process.
 3. Confirm job status is `captioned` and each selected clip has `captioned_file`.
 4. If output is only `rendered`, run:
-   `.venv/bin/python mvp.py caption JOB_ID --model small`
-5. If subtitle accuracy is obviously broken, retry with model `small` once. If still poor, skip upload and notify Admin with reason.
+   `.venv/bin/python mvp.py caption JOB_ID --model medium`
+5. If subtitle accuracy is obviously broken, retry with model `large-v3-turbo` or `large-v3` once. If still poor, skip upload and notify Admin with reason.
 
 YouTube upload:
 1. Upload exactly 2 final clips when possible:

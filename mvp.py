@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import argparse
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -23,6 +25,8 @@ YOUTUBE_SCOPES = [
 DEFAULT_YOUTUBE_CLIENT_SECRET = ROOT / "secrets" / "youtube_client_secret.json"
 DEFAULT_YOUTUBE_TOKEN_FILE = ROOT / "secrets" / "youtube_token.json"
 PENDING_APPROVALS_FILE = WORKSPACE / "metadata" / "pending-approvals.json"
+PIPELINE_LOCK_FILE = WORKSPACE / "tmp" / "content-pipeline.lock"
+PIPELINE_LOCK_ENV = "CONTENT_AUTOMATION_QUEUE_HELD"
 
 
 def now_iso():
@@ -64,6 +68,27 @@ def ytdlp_base_cmd():
 def ensure_dirs():
     for name in DIRS:
         (WORKSPACE / name).mkdir(parents=True, exist_ok=True)
+
+
+@contextlib.contextmanager
+def queued_pipeline(label):
+    """Serialize RAM-heavy clip jobs so Whisper/ffmpeg do not pile up."""
+    ensure_dirs()
+    if os.environ.get(PIPELINE_LOCK_ENV):
+        yield
+        return
+
+    with PIPELINE_LOCK_FILE.open("w") as lock:
+        print(f"[queue] waiting for content pipeline slot: {label}", file=sys.stderr)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        os.environ[PIPELINE_LOCK_ENV] = "1"
+        print(f"[queue] started: {label}", file=sys.stderr)
+        try:
+            yield
+        finally:
+            os.environ.pop(PIPELINE_LOCK_ENV, None)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            print(f"[queue] finished: {label}", file=sys.stderr)
 
 
 def load_job(job_id):
@@ -483,10 +508,11 @@ def video_encode_args():
     return ["-c:v", "mpeg4", "-q:v", "5"]
 
 
-def caption_job(job_id, model="small"):
-    script = ROOT / "scripts" / "render-subtitled-clips.py"
-    run([sys.executable, str(script), job_id, "--model", model])
-    return load_job(job_id).get("clips", [])
+def caption_job(job_id, model="medium"):
+    with queued_pipeline(f"caption {job_id}"):
+        script = ROOT / "scripts" / "render-subtitled-clips.py"
+        run([sys.executable, str(script), job_id, "--model", model])
+        return load_job(job_id).get("clips", [])
 
 
 def render_job(job_id, clips, duration_seconds):
@@ -972,6 +998,11 @@ def process_link_free(args):
 
 
 def process_link_autopilot(args):
+    with queued_pipeline("autopilot"):
+        return _process_link_autopilot(args)
+
+
+def _process_link_autopilot(args):
     job = new_youtube_job(args.url)
     result = {
         "job_id": job["job_id"],
@@ -996,10 +1027,14 @@ def process_link_autopilot(args):
         result["attempts"].append({"provider": "yt-dlp", "status": "downloaded"})
         render_job(downloaded["job_id"], args.clips, args.duration)
         result["attempts"].append({"provider": "local-ffmpeg", "status": "rendered"})
-        rendered = caption_job(downloaded["job_id"])
+        rendered = caption_job(downloaded["job_id"], args.caption_model)
         result["clips"] = rendered
         result["status"] = "captioned"
-        result["attempts"].append({"provider": "faster-whisper", "status": "captioned"})
+        result["attempts"].append({
+            "provider": "faster-whisper",
+            "status": "captioned",
+            "model": args.caption_model,
+        })
         print(json.dumps(result, indent=2, ensure_ascii=False))
     except RuntimeError as exc:
         job = load_job(job["job_id"])
@@ -1050,6 +1085,11 @@ def main():
     autopilot_p.add_argument("url")
     autopilot_p.add_argument("--clips", type=int, default=3)
     autopilot_p.add_argument("--duration", type=int, default=45)
+    autopilot_p.add_argument(
+        "--caption-model",
+        default="medium",
+        help="faster-whisper model for subtitles. medium is default upload quality; use large-v3/large-v3-turbo for best accuracy.",
+    )
     autopilot_p.set_defaults(func=process_link_autopilot)
 
     local_p = sub.add_parser("create-local-job")
@@ -1073,7 +1113,7 @@ def main():
 
     caption_p = sub.add_parser("caption")
     caption_p.add_argument("job_id")
-    caption_p.add_argument("--model", default="small")
+    caption_p.add_argument("--model", default="medium")
     caption_p.set_defaults(func=caption)
 
     approve_p = sub.add_parser("approve")
